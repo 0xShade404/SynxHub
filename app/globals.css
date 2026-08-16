@@ -1,0 +1,103 @@
+@import "tailwindcss";
+
+:root {
+  --background: #ffffff;
+  --surface: #f7f8fa;
+  --surface-raised: #ffffff;
+  --border: #e4e7ec;
+  --foreground: #0d1321;
+  --muted: #5b6472;
+
+  --brand: #2a3eb1;
+  --brand-strong: #1f2f8a;
+  --brand-soft: #eef0fb;
+
+  --accent: #0f9d8f;
+  --accent-soft: #e6f6f4;
+
+  --danger: #c22e3e;
+  --danger-soft: #fbecee;
+  --warning: #a15c07;
+  --warning-soft: #fdf3e3;
+  --success: #157a4a;
+  --success-soft: #e8f6ee;
+
+  --focus-ring: #2a3eb1;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-surface: var(--surface);
+  --color-surface-raised: var(--surface-raised);
+  --color-border: var(--border);
+  --color-foreground: var(--foreground);
+  --color-muted: var(--muted);
+
+  --color-brand: var(--brand);
+  --color-brand-strong: var(--brand-strong);
+  --color-brand-soft: var(--brand-soft);
+
+  --color-accent: var(--accent);
+  --color-accent-soft: var(--accent-soft);
+
+  --color-danger: var(--danger);
+  --color-danger-soft: var(--danger-soft);
+  --color-warning: var(--warning);
+  --color-warning-soft: var(--warning-soft);
+  --color-success: var(--success);
+  --color-success-soft: var(--success-soft);
+
+  --font-sans: var(--font-inter);
+  --font-mono: var(--font-mono);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #0a0e17;
+    --surface: #10141f;
+    --surface-raised: #141927;
+    --border: #232b3d;
+    --foreground: #eef1f6;
+    --muted: #97a1b3;
+
+    --brand: #6d7fe0;
+    --brand-strong: #8794e8;
+    --brand-soft: #1a2247;
+
+    --accent: #2fc4b0;
+    --accent-soft: #103832;
+
+    --danger: #ef6674;
+    --danger-soft: #3a1a20;
+    --warning: #e0a542;
+    --warning-soft: #3a2c0f;
+    --success: #4bcf94;
+    --success-soft: #10331f;
+
+    --focus-ring: #8794e8;
+  }
+}
+
+* {
+  border-color: var(--border);
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans), ui-sans-serif, system-ui, sans-serif;
+}
+
+::selection {
+  background: var(--brand-soft);
+  color: var(--brand-strong);
+}
+
+:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}

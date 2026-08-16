@@ -1,0 +1,16 @@
+{
+  "name": "SynxHub",
+  "short_name": "SynxHub",
+  "description": "Automated Crypto Investing. Built for Precision.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0a0e17",
+  "theme_color": "#0a0e17",
+  "icons": [
+    {
+      "src": "/favicon.ico",
+      "sizes": "48x48",
+      "type": "image/x-icon"
+    }
+  ]
+}

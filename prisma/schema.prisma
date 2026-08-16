@@ -1,0 +1,505 @@
+// SynxHub — Prisma schema
+//
+// Design notes:
+// - Financial state of record lives in `LedgerEntry` (append-only) plus the
+//   materialized `UserAssetBalance` cache that is updated inside the same
+//   DB transaction as each ledger write (see lib/ledger). The application
+//   layer never updates or deletes a posted LedgerEntry — corrections are
+//   made by posting a new `ADJUSTMENT` entry with an audit trail.
+// - Amounts use Decimal(36, 18) to safely represent the full range of
+//   supported on-chain token precisions.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Identity & Auth
+// ---------------------------------------------------------------------------
+
+enum UserRole {
+  INVESTOR
+  SUPPORT
+  COMPLIANCE
+  ADMIN
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  RESTRICTED
+  CLOSED
+}
+
+model User {
+  id            String     @id @default(cuid())
+  name          String?
+  email         String     @unique
+  emailVerified DateTime?
+  image         String?
+  role          UserRole   @default(INVESTOR)
+  status        UserStatus @default(ACTIVE)
+
+  // Dev-only credentials login (disabled in production; see lib/auth).
+  passwordHash String?
+
+  country String?
+
+  mfaEnabled        Boolean @default(false)
+  mfaSecretEnc       String? // TOTP secret, encrypted at rest via lib/security/crypto
+  mfaRecoveryCodesEnc String? // JSON array, encrypted at rest
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  accounts Account[]
+  sessions Session[]
+
+  balances            UserAssetBalance[]
+  ledgerEntries       LedgerEntry[]
+  deposits            Deposit[]
+  depositAddresses    DepositAddress[]
+  withdrawals         Withdrawal[]         @relation("WithdrawalOwner")
+  reviewedWithdrawals Withdrawal[]         @relation("WithdrawalReviewer")
+  allowlistAddresses  AllowlistAddress[]
+  devices             Device[]
+  loginEvents         LoginEvent[]
+  securityEvents      SecurityEvent[]
+  auditLogsAsActor    AuditLog[]           @relation("AuditActor")
+  kycRecords          KycRecord[]
+  sanctionsScreenings SanctionsScreening[]
+
+  @@index([email])
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// ---------------------------------------------------------------------------
+// Asset universe (admin-configurable)
+// ---------------------------------------------------------------------------
+
+model Asset {
+  id      String @id @default(cuid())
+  symbol  String @unique
+  name    String
+  network String
+
+  contractAddress String?
+  decimals        Int     @default(18)
+  iconUrl         String?
+
+  // Strategy configuration
+  targetAllocationBps Int     @default(0) // basis points of total strategy (10000 = 100%)
+  sortOrder           Int     @default(0)
+
+  // Feature flags
+  enabled           Boolean @default(true)
+  depositEnabled    Boolean @default(true)
+  withdrawalEnabled Boolean @default(true)
+  tradingEnabled    Boolean @default(true)
+
+  // Pricing (never fabricated in production — see lib/pricing)
+  currentPriceUsd Decimal  @default(0) @db.Decimal(36, 18)
+  priceSource     String   @default("DEMO_FIXTURE") // DEMO_FIXTURE | LIVE_FEED:<provider>
+  priceUpdatedAt  DateTime @default(now())
+  isDemoData      Boolean  @default(true)
+
+  requiredConfirmations Int @default(12)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  balances         UserAssetBalance[]
+  ledgerEntries    LedgerEntry[]
+  deposits         Deposit[]
+  depositAddresses DepositAddress[]
+  withdrawals      Withdrawal[]
+  allowlist        AllowlistAddress[]
+
+  @@index([enabled])
+}
+
+// ---------------------------------------------------------------------------
+// Ledger — the single source of truth for investor balances
+// ---------------------------------------------------------------------------
+
+enum LedgerEntryType {
+  DEPOSIT
+  WITHDRAWAL
+  WITHDRAWAL_RESERVE
+  WITHDRAWAL_RELEASE
+  ALLOCATION
+  REBALANCE
+  TRADE
+  NETWORK_FEE
+  PLATFORM_FEE
+  PROFIT_LOSS
+  ADJUSTMENT
+}
+
+enum LedgerDirection {
+  CREDIT
+  DEBIT
+}
+
+enum LedgerStatus {
+  POSTED
+  REVERSED
+}
+
+enum LedgerSource {
+  DEPOSIT_SERVICE
+  WITHDRAWAL_SERVICE
+  STRATEGY_ENGINE
+  ADMIN
+  SYSTEM
+}
+
+model LedgerEntry {
+  id     String @id @default(cuid())
+  userId String
+  assetId String
+
+  type      LedgerEntryType
+  direction LedgerDirection
+  amount    Decimal @db.Decimal(36, 18) // always positive; direction determines sign
+  status    LedgerStatus @default(POSTED)
+  source    LedgerSource
+
+  previousBalance Decimal @db.Decimal(36, 18)
+  resultingBalance Decimal @db.Decimal(36, 18)
+
+  // External correlation
+  reference      String? // e.g. on-chain tx hash, deposit id, withdrawal id
+  depositId      String?
+  withdrawalId   String?
+
+  // Prevents duplicate postings (replay protection) — unique per logical event.
+  idempotencyKey String @unique
+
+  // Free-form audit metadata: actor, ip, notes, admin authorization reference, etc.
+  metadata Json?
+
+  reversedByEntryId String? @unique
+  reversalOfEntryId String? @unique
+
+  createdAt DateTime @default(now())
+
+  user       User        @relation(fields: [userId], references: [id])
+  asset      Asset       @relation(fields: [assetId], references: [id])
+  deposit    Deposit?    @relation(fields: [depositId], references: [id])
+  withdrawal Withdrawal? @relation(fields: [withdrawalId], references: [id])
+
+  @@index([userId, assetId, createdAt])
+  @@index([userId, createdAt])
+}
+
+// Materialized balance cache, updated transactionally alongside each
+// LedgerEntry insert. Row-locked (SELECT ... FOR UPDATE) during posting to
+// serialize concurrent writes for the same user+asset and prevent races.
+model UserAssetBalance {
+  id     String @id @default(cuid())
+  userId String
+  assetId String
+
+  balance         Decimal @default(0) @db.Decimal(36, 18)
+  reservedBalance Decimal @default(0) @db.Decimal(36, 18) // locked for pending withdrawals
+
+  updatedAt DateTime @updatedAt
+
+  user  User  @relation(fields: [userId], references: [id])
+  asset Asset @relation(fields: [assetId], references: [id])
+
+  @@unique([userId, assetId])
+}
+
+// ---------------------------------------------------------------------------
+// Deposits
+// ---------------------------------------------------------------------------
+
+enum DepositStatus {
+  AWAITING_FUNDS
+  CONFIRMING
+  COMPLETED
+  FAILED
+}
+
+model DepositAddress {
+  id       String @id @default(cuid())
+  userId   String
+  assetId  String
+  network  String
+  address  String
+  provider String // custody provider identifier, e.g. "mock-custody"
+
+  createdAt DateTime @default(now())
+
+  user     User      @relation(fields: [userId], references: [id])
+  asset    Asset     @relation(fields: [assetId], references: [id])
+  deposits Deposit[]
+
+  @@unique([userId, assetId])
+  @@index([address])
+}
+
+model Deposit {
+  id               String @id @default(cuid())
+  userId           String
+  assetId          String
+  depositAddressId String
+
+  network       String
+  amount        Decimal? @db.Decimal(36, 18)
+  txHash        String?
+  confirmations Int      @default(0)
+  requiredConfirmations Int @default(12)
+  status        DepositStatus @default(AWAITING_FUNDS)
+
+  idempotencyKey String  @unique
+  failureReason  String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user           User            @relation(fields: [userId], references: [id])
+  asset          Asset           @relation(fields: [assetId], references: [id])
+  depositAddress DepositAddress  @relation(fields: [depositAddressId], references: [id])
+  ledgerEntries  LedgerEntry[]
+
+  @@index([userId, createdAt])
+  @@index([txHash])
+}
+
+// ---------------------------------------------------------------------------
+// Withdrawals
+// ---------------------------------------------------------------------------
+
+enum WithdrawalStatus {
+  PENDING_CONFIRMATION
+  PENDING_REVIEW
+  APPROVED
+  PROCESSING
+  COMPLETED
+  REJECTED
+  FAILED
+  ON_HOLD
+}
+
+model AllowlistAddress {
+  id      String @id @default(cuid())
+  userId  String
+  assetId String
+  network String
+  address String
+  label   String?
+  status  String  @default("PENDING") // PENDING | APPROVED
+
+  createdAt  DateTime  @default(now())
+  approvedAt DateTime?
+
+  user  User  @relation(fields: [userId], references: [id])
+  asset Asset @relation(fields: [assetId], references: [id])
+
+  @@unique([userId, assetId, address])
+}
+
+model Withdrawal {
+  id      String @id @default(cuid())
+  userId  String
+  assetId String
+
+  network             String
+  destinationAddress  String
+  amount              Decimal @db.Decimal(36, 18)
+  networkFeeEstimate  Decimal @default(0) @db.Decimal(36, 18)
+  expectedNetAmount   Decimal @db.Decimal(36, 18)
+
+  status     WithdrawalStatus @default(PENDING_CONFIRMATION)
+  riskScore  Int              @default(0)
+  riskFlags  Json?
+  holdReason String?
+
+  mfaVerifiedAt DateTime?
+  idempotencyKey String @unique
+
+  txHash      String?
+  failureReason String?
+
+  requestedAt DateTime  @default(now())
+  reviewedAt  DateTime?
+  processedAt DateTime?
+
+  reviewedByUserId String?
+
+  user       User          @relation("WithdrawalOwner", fields: [userId], references: [id])
+  reviewedBy User?         @relation("WithdrawalReviewer", fields: [reviewedByUserId], references: [id])
+  asset      Asset         @relation(fields: [assetId], references: [id])
+  ledgerEntries LedgerEntry[]
+
+  @@index([userId, requestedAt])
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------------
+// Security
+// ---------------------------------------------------------------------------
+
+model Device {
+  id                String   @id @default(cuid())
+  userId            String
+  deviceFingerprint String
+  userAgent         String?
+  ipAddress         String?
+  trusted           Boolean  @default(false)
+  firstSeenAt       DateTime @default(now())
+  lastSeenAt        DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@unique([userId, deviceFingerprint])
+}
+
+model LoginEvent {
+  id        String   @id @default(cuid())
+  userId    String?
+  email     String
+  method    String // GOOGLE | CREDENTIALS
+  success   Boolean
+  ipAddress String?
+  userAgent String?
+  riskFlag  String?
+  createdAt DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id])
+
+  @@index([userId, createdAt])
+  @@index([email, createdAt])
+}
+
+model SecurityEvent {
+  id        String   @id @default(cuid())
+  userId    String
+  type      String // NEW_DEVICE | NEW_WITHDRAWAL_ADDRESS | SUSPICIOUS_LOGIN | RATE_LIMITED | MFA_ENABLED | MFA_DISABLED | ACCOUNT_LOCKED | WITHDRAWAL_HOLD
+  severity  String // INFO | LOW | MEDIUM | HIGH | CRITICAL
+  metadata  Json?
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId, createdAt])
+}
+
+model AuditLog {
+  id           String   @id @default(cuid())
+  actorUserId  String?
+  actorRole    String?
+  action       String
+  targetType   String
+  targetId     String?
+  metadata     Json?
+  ipAddress    String?
+  createdAt    DateTime @default(now())
+
+  actor User? @relation("AuditActor", fields: [actorUserId], references: [id])
+
+  @@index([targetType, targetId])
+  @@index([createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Compliance
+// ---------------------------------------------------------------------------
+
+enum KycStatus {
+  NOT_STARTED
+  PENDING
+  APPROVED
+  REJECTED
+  EXPIRED
+}
+
+model KycRecord {
+  id       String @id @default(cuid())
+  userId   String
+  provider String @default("mock-kyc") // integration point for a real KYC/AML vendor
+
+  status             KycStatus @default(NOT_STARTED)
+  riskLevel          String? // LOW | MEDIUM | HIGH
+  country            String?
+  externalReferenceId String?
+  reviewerNote       String?
+
+  submittedAt DateTime?
+  reviewedAt  DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+}
+
+model SanctionsScreening {
+  id       String @id @default(cuid())
+  userId   String
+  provider String @default("mock-sanctions")
+  status   String @default("PENDING") // CLEAR | FLAGGED | PENDING
+  metadata Json?
+
+  screenedAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+}
+
+model RestrictedJurisdiction {
+  id          String  @id @default(cuid())
+  countryCode String  @unique
+  reason      String?
+  enabled     Boolean @default(true)
+
+  createdAt DateTime @default(now())
+}
